@@ -1,5 +1,6 @@
 """FastAPI backend for AI-Council."""
 
+import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -22,10 +23,15 @@ from .config import CAPABILITY_POOLS
 
 app = FastAPI(title="AI-Council API")
 
-# Enable CORS for local development
+# Local dev origins are always allowed; add the deployed frontend's origin(s)
+# via ALLOWED_ORIGINS (comma-separated) as a Vercel env var, e.g.
+# "https://ai-council-frontend.vercel.app,https://your-custom-domain.com"
+_default_origins = ["http://localhost:5173", "http://localhost:3000"]
+_extra_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_default_origins + _extra_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -82,8 +82,33 @@ Then open http://localhost:5173 in your browser.
 
 - **Backend:** FastAPI (Python 3.10+), async httpx, OpenRouter API
 - **Frontend:** React + Vite, react-markdown for rendering, lucide-react for icons
-- **Storage:** JSON files in `data/conversations/`
+- **Storage:** JSON files in `data/conversations/` locally; Upstash Redis when `UPSTASH_REDIS_REST_URL` is set (e.g. on Vercel) - see `backend/storage.py`
 - **Package Management:** uv for Python, npm for JavaScript
+
+## Deploying to Vercel
+
+The backend and frontend deploy as **two separate Vercel projects** from this same repo (Vercel supports linking multiple projects to one GitHub repo, each with its own Root Directory).
+
+### Backend project
+
+- **Root Directory:** `.` (the repo root - leave it as-is)
+- Vercel auto-detects `api/index.py` as a Python serverless function; it imports and serves the FastAPI app from `backend/main.py` directly. `requirements.txt` at the repo root is what Vercel installs from (kept separate from `pyproject.toml`/`uv.lock`, which are for local dev via `uv`).
+- `vercel.json` rewrites every path to that one function, so FastAPI's own router handles `/`, `/api/conversations`, etc. exactly as it does locally.
+- **Environment variables to set** (Vercel dashboard → Settings → Environment Variables):
+  - `OPENROUTER_API_KEY` - required
+  - `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` - required for persistence. Easiest path: Vercel dashboard → Storage → Create Database → pick the Upstash/Redis integration → connect it to this project, which sets both automatically. (Without these, the app falls back to local JSON files - which don't persist on Vercel's serverless filesystem, so conversations would vanish between requests.)
+  - `ALLOWED_ORIGINS` - the frontend project's deployed URL(s), comma-separated (e.g. `https://ai-council-frontend.vercel.app`)
+- **Function timeout:** the gateway's multi-stage pipeline can take anywhere from ~1 to several minutes on free-tier OpenRouter models, especially under rate limiting. Vercel's default function duration caps vary by plan - raise it as high as your plan allows by adding to `vercel.json`:
+  ```json
+  { "functions": { "api/index.py": { "maxDuration": 60 } } }
+  ```
+  Even with this raised, a very slow/rate-limited run can still exceed the limit and the request will fail with no partial result saved - a known tradeoff of running this pipeline as a single serverless request (see CLAUDE.md for the alternative job-queue design if that becomes a problem).
+
+### Frontend project
+
+- **Root Directory:** `frontend`
+- Framework preset: Vite (auto-detected)
+- **Environment variable:** `VITE_API_BASE` = the backend project's deployed URL (e.g. `https://ai-council-backend.vercel.app`)
 
 ## Credits
 

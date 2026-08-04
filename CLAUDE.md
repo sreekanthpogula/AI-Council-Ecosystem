@@ -18,7 +18,7 @@ All models are OpenRouter free-tier (`:free`) models, chosen so the whole gatewa
 
 **`config.py`**
 - `CAPABILITY_POOLS`: dict of `{capability_name: {description, models, chairman}}` - the routing table. Currently: `reasoning`, `acting`, `vision`, `audio`.
-- `BOSS_MODEL`: routes requests to a capability, and doubles as the default chairman for every pool (largest free model available: `nvidia/nemotron-3-ultra-550b-a55b:free`)
+- `BOSS_MODEL`: routes requests to a capability, and doubles as the default chairman for every pool - currently `nvidia/nemotron-3-super-120b-a12b:free` (see the Rate Limits/reliability section below for why the largest free model isn't used here)
 - `TITLE_MODEL`: separate free model for conversation-title generation (previously hardcoded to a paid model - fixed since that broke the "run for free" goal)
 - `AUDIO_OUTPUT_MODEL`: `None` by default - no free OpenRouter model does text-to-speech yet; set to a paid model id to enable spoken responses
 - Uses environment variable `OPENROUTER_API_KEY` from `.env`
@@ -50,17 +50,19 @@ All models are OpenRouter free-tier (`:free`) models, chosen so the whole gatewa
 - `parse_ranking_from_text()`: Extracts "FINAL RANKING:" section, handles both numbered lists and plain format
 - `calculate_aggregate_rankings()`: Computes average rank position across all peer evaluations
 
-**`storage.py`**
-- JSON-based conversation storage in `data/conversations/`
+**`storage.py`** - Dual-Backend (File / Redis)
+- **Two backends, chosen automatically at import time**: Upstash Redis (via the `upstash-redis` REST client) when `UPSTASH_REDIS_REST_URL` is set in the environment, otherwise local JSON files under `DATA_DIR`. This is what makes the same codebase work both for local dev (file backend, exactly as before) and for a Vercel deployment (serverless functions have no persistent filesystem, so they need Redis) without an `if VERCEL` special case anywhere else in the app - `main.py`/`gateway.py`/`council.py` all just call the same `storage.*` functions regardless of which backend is active.
+- Redis layout: each conversation is a JSON blob at key `conversation:{id}`; a sorted set `conversations:index` (member=id, score=`created_at` as epoch seconds) tracks all conversation ids for `list_conversations()`, sorted newest-first via `zrange(..., rev=True)`.
+- `Redis.from_env()` (from the `upstash-redis` package) reads `UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN` directly - these are exactly the env var names Vercel's Upstash integration sets when you connect a Redis database to a project via the Storage tab, so no manual mapping is needed.
 - Each conversation: `{id, created_at, title, messages[]}`
 - User messages: `{role, content, attachment?: {base64, mime_type, name}}` - attachment is persisted in full so history reloads can re-render it
 - Assistant messages: `{role, stage1, stage2, stage3, capability}`
 - Note: metadata (label_to_model, aggregate_rankings) is NOT persisted to storage, only returned via API
-- Full CRUD now: `create_conversation`, `get_conversation`/`list_conversations`, `update_conversation_title` (rename), `delete_conversation` (removes the JSON file, returns bool)
-- `get_conversation_path()` validates `conversation_id` against `^[a-zA-Z0-9_-]+$` and raises `ValueError` on anything else - conversation IDs are self-generated uuid4s, but they also arrive as untrusted URL path params on every read/rename/delete call, so this closes a path-traversal hole (e.g. an id of `../../etc/passwd`) that `delete_conversation` in particular would otherwise open up. `get_conversation` catches the `ValueError` and returns `None` (preserves the existing 404 behavior) rather than letting it bubble up.
+- Full CRUD: `create_conversation`, `get_conversation`/`list_conversations`, `update_conversation_title` (rename), `delete_conversation` (returns bool)
+- Conversation IDs are validated against `^[a-zA-Z0-9_-]+$` before touching either backend (`_validate_id`) - conversation IDs are self-generated uuid4s, but they also arrive as untrusted URL path params on every read/rename/delete call, so this closes a path-traversal hole (file backend: an id of `../../etc/passwd`) and a Redis-key-injection hole (e.g. wildcards/newlines) that `delete_conversation` in particular would otherwise open up. `get_conversation` catches the `ValueError` and returns `None` (preserves the existing 404 behavior) rather than letting it bubble up.
 
 **`main.py`**
-- FastAPI app with CORS enabled for localhost:5173 and localhost:3000
+- FastAPI app with CORS: always allows `localhost:5173`/`localhost:3000` for local dev, plus whatever's in the comma-separated `ALLOWED_ORIGINS` env var (needed for the deployed frontend's origin - see Vercel section below)
 - `SendMessageRequest` accepts optional `attachment_base64` / `attachment_mime_type` / `attachment_name`
 - POST `/api/conversations/{id}/message`: routes via `gateway.run_gateway_request()`, returns `{stage1, stage2, stage3, metadata}` where metadata includes `capability`, `label_to_model`, `aggregate_rankings`
 - POST `/api/conversations/{id}/message/stream`: same flow but staged as SSE events, with a `routing_start`/`routing_complete` pair emitted before `stage1_start` so the UI can show which capability/pool was chosen
@@ -196,6 +198,16 @@ During the build/test session, heavy testing plus concurrent real usage on the s
 
 ### Storage Resilience
 `main.py`'s `send_message`/`send_message_stream` wrap the final `storage.add_assistant_message()` call in a try/except - a multi-minute gateway run (several sequential free-tier LLM calls) shouldn't 500 and discard its results just because saving at the very end hit a storage hiccup (e.g. the conversation file being gone by the time the request finishes). This was observed once during testing with no clear cause (no delete feature exists in the app) - possibly external interference (antivirus/sync/concurrent process) rather than app logic, but the endpoint is now resilient to it either way.
+
+## Deployment (Vercel)
+
+The repo deploys as **two separate Vercel projects** from the same GitHub repo (`sreekanthpogula/AI-Council-Ecosystem`), each with a different Root Directory - see README.md's "Deploying to Vercel" section for the exact dashboard steps and env vars. Notes specific to *why* it's built this way:
+
+- **`api/index.py`** (repo root) is the only file Vercel's Python runtime needs - it just does `from backend.main import app`. Vercel auto-detects the ASGI `app` object and serves it; no WSGI adapter (e.g. Mangum) is needed for FastAPI on Vercel specifically.
+- **`vercel.json`** rewrites every path to that one function (`"/(.*)"` → `/api/index`), so FastAPI's own router still handles `/`, `/api/conversations`, etc. exactly as it does locally - Vercel's filesystem routing alone would only map `api/index.py` to `/api`/`/api/index`, not to the app's other routes, without this rewrite.
+- **`requirements.txt`** (repo root) is what Vercel's Python builder installs from - kept deliberately separate from `pyproject.toml`/`uv.lock` (used for local dev via `uv sync`) since Vercel doesn't read uv's files. `uvicorn` is intentionally omitted from it (only needed for local `python -m backend.main`, not for how Vercel invokes the ASGI app) - if you add a new backend dependency, add it to **both** files.
+- **Why two Vercel projects instead of one monorepo project**: it maps cleanly onto each side's own framework auto-detection (Vite for `frontend/`, Python for the repo root) without needing a `builds`/legacy-routes array to teach one project about both halves. The tradeoff is CORS is real (different origins) instead of same-origin - that's what `ALLOWED_ORIGINS`/`VITE_API_BASE` are for.
+- **The chosen tradeoff on the pipeline/timeout question**: this deployment keeps the existing single-long-request SSE model rather than rewriting to a job-queue + polling design. That means a slow/rate-limited run can still get killed by Vercel's function timeout with no partial result saved - functionally similar to the existing "all models failed" degradation path, just with a different trigger. If this turns out to be a frequent problem in practice (not just theoretical), the fix is to decouple: `POST /message` returns a job id immediately, a background function advances stage1→2→3 writing progress into Redis as it goes, and the frontend polls instead of holding one SSE connection open. That's a substantially bigger change (new job model, polling replaces the SSE handler in `App.jsx`) - deliberately not done up front since it wasn't clear yet whether timeouts would actually bite in practice.
 
 ## Common Gotchas
 

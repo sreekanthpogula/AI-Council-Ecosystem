@@ -2,7 +2,9 @@
  * API client for the AI-Council backend.
  */
 
-const API_BASE = 'http://localhost:8001';
+// Set VITE_API_BASE in the deployed environment (e.g. Vercel project env vars)
+// to the backend's URL. Falls back to the local dev backend otherwise.
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8001';
 
 /**
  * Reads a File into a base64 string (no "data:...;base64," prefix).

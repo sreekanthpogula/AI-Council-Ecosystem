@@ -1,4 +1,15 @@
-"""JSON-based storage for conversations."""
+"""Conversation storage.
+
+Two backends, selected automatically:
+- Upstash Redis (via the `upstash-redis` REST client), when UPSTASH_REDIS_REST_URL
+  is set - this is what Vercel serverless functions need, since they have no
+  persistent local filesystem.
+- Local JSON files under DATA_DIR, otherwise - keeps local development working
+  exactly as before without requiring an Upstash database.
+
+Only the raw get/save/list-ids/delete primitives differ between backends;
+everything else (message shape, attachment handling, etc.) is shared.
+"""
 
 import json
 import os
@@ -10,27 +21,104 @@ from .config import DATA_DIR
 
 # Conversation IDs are always uuid4 strings we generate ourselves, but since
 # they also arrive as untrusted URL path params (GET/PATCH/DELETE), validate
-# before building a filesystem path from one - otherwise something like
-# "../../etc/passwd" as an id would let a request read or delete arbitrary
-# files. This matters more now that delete_conversation() exists.
+# before building a filesystem path or Redis key from one - otherwise
+# something like "../../etc/passwd" (file backend) or a wildcard/newline
+# (Redis backend) as an id could do something unintended.
 _CONVERSATION_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+_USE_REDIS = bool(os.getenv("UPSTASH_REDIS_REST_URL"))
+_redis_client = None
+
+
+def _redis():
+    global _redis_client
+    if _redis_client is None:
+        from upstash_redis import Redis
+        _redis_client = Redis.from_env()
+    return _redis_client
+
+
+_CONVERSATION_KEY_PREFIX = "conversation:"
+_INDEX_KEY = "conversations:index"  # sorted set: member=id, score=created_at epoch seconds
+
+
+def _validate_id(conversation_id: str):
+    if not _CONVERSATION_ID_PATTERN.match(conversation_id):
+        raise ValueError(f"Invalid conversation id: {conversation_id}")
+
+
+def _epoch(iso_timestamp: str) -> float:
+    return datetime.fromisoformat(iso_timestamp).timestamp()
+
+
+# ---------------------------------------------------------------------------
+# Raw backend primitives
+# ---------------------------------------------------------------------------
+
+def _raw_get(conversation_id: str) -> Optional[Dict[str, Any]]:
+    if _USE_REDIS:
+        raw = _redis().get(_CONVERSATION_KEY_PREFIX + conversation_id)
+        return json.loads(raw) if raw else None
+
+    path = _file_path(conversation_id)
+    if not os.path.exists(path):
+        return None
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def _raw_save(conversation: Dict[str, Any]):
+    if _USE_REDIS:
+        _redis().set(_CONVERSATION_KEY_PREFIX + conversation["id"], json.dumps(conversation))
+        _redis().zadd(_INDEX_KEY, {conversation["id"]: _epoch(conversation["created_at"])})
+        return
+
+    ensure_data_dir()
+    path = _file_path(conversation["id"])
+    with open(path, 'w') as f:
+        json.dump(conversation, f, indent=2)
+
+
+def _raw_delete(conversation_id: str) -> bool:
+    if _USE_REDIS:
+        removed = _redis().delete(_CONVERSATION_KEY_PREFIX + conversation_id)
+        _redis().zrem(_INDEX_KEY, conversation_id)
+        return bool(removed)
+
+    path = _file_path(conversation_id)
+    if not os.path.exists(path):
+        return False
+    os.remove(path)
+    return True
+
+
+def _raw_list_ids() -> List[str]:
+    if _USE_REDIS:
+        # Newest first.
+        return _redis().zrange(_INDEX_KEY, 0, -1, rev=True)
+
+    ensure_data_dir()
+    return [
+        filename[:-len('.json')]
+        for filename in os.listdir(DATA_DIR)
+        if filename.endswith('.json')
+    ]
+
+
+def _file_path(conversation_id: str) -> str:
+    _validate_id(conversation_id)
+    return os.path.join(DATA_DIR, f"{conversation_id}.json")
 
 
 def ensure_data_dir():
-    """Ensure the data directory exists."""
-    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    """Ensure the local data directory exists (file backend only)."""
+    if not _USE_REDIS:
+        Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
 
-def get_conversation_path(conversation_id: str) -> str:
-    """Get the file path for a conversation.
-
-    Raises:
-        ValueError: if conversation_id isn't a safe, simple identifier
-    """
-    if not _CONVERSATION_ID_PATTERN.match(conversation_id):
-        raise ValueError(f"Invalid conversation id: {conversation_id}")
-    return os.path.join(DATA_DIR, f"{conversation_id}.json")
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def create_conversation(conversation_id: str) -> Dict[str, Any]:
     """
@@ -42,7 +130,7 @@ def create_conversation(conversation_id: str) -> Dict[str, Any]:
     Returns:
         New conversation dict
     """
-    ensure_data_dir()
+    _validate_id(conversation_id)
 
     conversation = {
         "id": conversation_id,
@@ -51,11 +139,7 @@ def create_conversation(conversation_id: str) -> Dict[str, Any]:
         "messages": []
     }
 
-    # Save to file
-    path = get_conversation_path(conversation_id)
-    with open(path, 'w') as f:
-        json.dump(conversation, f, indent=2)
-
+    _raw_save(conversation)
     return conversation
 
 
@@ -70,15 +154,11 @@ def get_conversation(conversation_id: str) -> Optional[Dict[str, Any]]:
         Conversation dict or None if not found
     """
     try:
-        path = get_conversation_path(conversation_id)
+        _validate_id(conversation_id)
     except ValueError:
         return None
 
-    if not os.path.exists(path):
-        return None
-
-    with open(path, 'r') as f:
-        return json.load(f)
+    return _raw_get(conversation_id)
 
 
 def save_conversation(conversation: Dict[str, Any]):
@@ -88,37 +168,31 @@ def save_conversation(conversation: Dict[str, Any]):
     Args:
         conversation: Conversation dict to save
     """
-    ensure_data_dir()
-
-    path = get_conversation_path(conversation['id'])
-    with open(path, 'w') as f:
-        json.dump(conversation, f, indent=2)
+    _validate_id(conversation['id'])
+    _raw_save(conversation)
 
 
 def list_conversations() -> List[Dict[str, Any]]:
     """
-    List all conversations (metadata only).
+    List all conversations (metadata only), newest first.
 
     Returns:
         List of conversation metadata dicts
     """
-    ensure_data_dir()
-
     conversations = []
-    for filename in os.listdir(DATA_DIR):
-        if filename.endswith('.json'):
-            path = os.path.join(DATA_DIR, filename)
-            with open(path, 'r') as f:
-                data = json.load(f)
-                # Return metadata only
-                conversations.append({
-                    "id": data["id"],
-                    "created_at": data["created_at"],
-                    "title": data.get("title", "New Conversation"),
-                    "message_count": len(data["messages"])
-                })
+    for conversation_id in _raw_list_ids():
+        data = _raw_get(conversation_id)
+        if data is None:
+            continue
+        conversations.append({
+            "id": data["id"],
+            "created_at": data["created_at"],
+            "title": data.get("title", "New Conversation"),
+            "message_count": len(data["messages"])
+        })
 
-    # Sort by creation time, newest first
+    # The Redis backend already returns ids newest-first; the file backend
+    # doesn't have an inherent order, so sort explicitly either way.
     conversations.sort(key=lambda x: x["created_at"], reverse=True)
 
     return conversations
@@ -208,7 +282,7 @@ def update_conversation_title(conversation_id: str, title: str):
 
 def delete_conversation(conversation_id: str) -> bool:
     """
-    Delete a conversation's storage file.
+    Delete a conversation.
 
     Args:
         conversation_id: Conversation identifier
@@ -217,12 +291,8 @@ def delete_conversation(conversation_id: str) -> bool:
         True if a conversation was deleted, False if it didn't exist
     """
     try:
-        path = get_conversation_path(conversation_id)
+        _validate_id(conversation_id)
     except ValueError:
         return False
 
-    if not os.path.exists(path):
-        return False
-
-    os.remove(path)
-    return True
+    return _raw_delete(conversation_id)

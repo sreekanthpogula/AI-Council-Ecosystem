@@ -1,0 +1,8 @@
+# Dependencies for the Vercel Python serverless function (see api/index.py).
+# Local development uses pyproject.toml/uv.lock instead (via `uv sync`) -
+# keep the two in sync when adding/removing a backend dependency.
+fastapi>=0.115.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+pydantic>=2.9.0
+upstash-redis>=1.7.0
