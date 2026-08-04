@@ -1,9 +1,10 @@
 """Conversation storage.
 
 Two backends, selected automatically:
-- Upstash Redis (via the `upstash-redis` REST client), when UPSTASH_REDIS_REST_URL
-  is set - this is what Vercel serverless functions need, since they have no
-  persistent local filesystem.
+- Upstash Redis (via the `upstash-redis` REST client), when Upstash REST
+  credentials are found under any of a few known env var naming conventions
+  (see _UPSTASH_ENV_VAR_PAIRS) - this is what Vercel serverless functions
+  need, since they have no persistent local filesystem.
 - Local JSON files under DATA_DIR, otherwise - keeps local development working
   exactly as before without requiring an Upstash database.
 
@@ -26,7 +27,28 @@ from .config import DATA_DIR
 # (Redis backend) as an id could do something unintended.
 _CONVERSATION_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 
-_USE_REDIS = bool(os.getenv("UPSTASH_REDIS_REST_URL"))
+# Vercel's Upstash marketplace integration doesn't always name these
+# UPSTASH_REDIS_REST_URL/_TOKEN like `Redis.from_env()` expects - depending on
+# the prefix chosen (or defaulted to) when connecting the database in the
+# Storage tab, it can come out as e.g. UPSTASH_REDIS_REST_KV_REST_API_URL
+# (the "KV_REST_API_*" part is the legacy Vercel KV naming the integration
+# still uses under the hood). Check known variants rather than assuming one.
+_UPSTASH_ENV_VAR_PAIRS = [
+    ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"),
+    ("KV_REST_API_URL", "KV_REST_API_TOKEN"),
+    ("UPSTASH_REDIS_REST_KV_REST_API_URL", "UPSTASH_REDIS_REST_KV_REST_API_TOKEN"),
+]
+
+
+def _find_upstash_credentials() -> Optional[tuple]:
+    for url_var, token_var in _UPSTASH_ENV_VAR_PAIRS:
+        url, token = os.getenv(url_var), os.getenv(token_var)
+        if url and token:
+            return url, token
+    return None
+
+
+_USE_REDIS = _find_upstash_credentials() is not None
 _redis_client = None
 
 
@@ -34,7 +56,8 @@ def _redis():
     global _redis_client
     if _redis_client is None:
         from upstash_redis import Redis
-        _redis_client = Redis.from_env()
+        url, token = _find_upstash_credentials()
+        _redis_client = Redis(url, token)
     return _redis_client
 
 
