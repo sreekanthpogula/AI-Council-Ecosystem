@@ -3,7 +3,12 @@ name = "llm-council"
 version = "1.0.0"
 description = "AI-Council - a boss-routed, multimodal multi-model AI advisory board"
 readme = "README.md"
-requires-python = ">=3.10"
+# >=3.12 because Vercel's Python builder installs its own vercel-runtime
+# helper package into the same uv-managed venv as our dependencies, and that
+# package requires Python 3.12+ - a lower floor here causes uv to resolve
+# uv.lock against 3.10/3.11, which then conflicts with vercel-runtime at
+# Vercel build time (even though it builds fine locally).
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
