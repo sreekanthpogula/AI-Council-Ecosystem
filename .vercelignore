@@ -1,0 +1,16 @@
+# Vercel CLI deploys upload the local working directory directly (unlike git
+# push, this does NOT automatically respect .gitignore), so local-only state
+# needs its own explicit exclusion here - most importantly `data/`, since
+# those are local test conversations from the file-storage backend, not
+# anything that should ship in the deployment bundle.
+data/
+.venv
+__pycache__/
+*.py[oc]
+.env
+.env*
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+.git
