@@ -57,13 +57,52 @@ function App() {
     setCurrentConversationId(id);
   };
 
-  const handleSendMessage = async (content) => {
+  const handleGoHome = () => {
+    setCurrentConversationId(null);
+    setCurrentConversation(null);
+  };
+
+  const handleRenameConversation = async (id, title) => {
+    try {
+      await api.renameConversation(id, title);
+      setConversations((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, title } : c))
+      );
+      if (id === currentConversationId) {
+        setCurrentConversation((prev) => (prev ? { ...prev, title } : prev));
+      }
+    } catch (error) {
+      console.error('Failed to rename conversation:', error);
+    }
+  };
+
+  const handleDeleteConversation = async (id) => {
+    try {
+      await api.deleteConversation(id);
+      setConversations((prev) => prev.filter((c) => c.id !== id));
+      if (id === currentConversationId) {
+        setCurrentConversationId(null);
+        setCurrentConversation(null);
+      }
+    } catch (error) {
+      console.error('Failed to delete conversation:', error);
+    }
+  };
+
+  const handleSendMessage = async (content, attachment = null) => {
     if (!currentConversationId) return;
 
     setIsLoading(true);
     try {
       // Optimistically add user message to UI
       const userMessage = { role: 'user', content };
+      if (attachment) {
+        userMessage.attachment = {
+          base64: attachment.base64,
+          mime_type: attachment.mimeType,
+          name: attachment.name,
+        };
+      }
       setCurrentConversation((prev) => ({
         ...prev,
         messages: [...prev.messages, userMessage],
@@ -72,11 +111,13 @@ function App() {
       // Create a partial assistant message that will be updated progressively
       const assistantMessage = {
         role: 'assistant',
+        routing: null,
         stage1: null,
         stage2: null,
         stage3: null,
         metadata: null,
         loading: {
+          routing: false,
           stage1: false,
           stage2: false,
           stage3: false,
@@ -92,6 +133,25 @@ function App() {
       // Send message with streaming
       await api.sendMessageStream(currentConversationId, content, (eventType, event) => {
         switch (eventType) {
+          case 'routing_start':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.loading.routing = true;
+              return { ...prev, messages };
+            });
+            break;
+
+          case 'routing_complete':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.routing = event.data;
+              lastMsg.loading.routing = false;
+              return { ...prev, messages };
+            });
+            break;
+
           case 'stage1_start':
             setCurrentConversation((prev) => {
               const messages = [...prev.messages];
@@ -169,7 +229,7 @@ function App() {
           default:
             console.log('Unknown event type:', eventType);
         }
-      });
+      }, attachment);
     } catch (error) {
       console.error('Failed to send message:', error);
       // Remove optimistic messages on error
@@ -188,6 +248,9 @@ function App() {
         currentConversationId={currentConversationId}
         onSelectConversation={handleSelectConversation}
         onNewConversation={handleNewConversation}
+        onRenameConversation={handleRenameConversation}
+        onDeleteConversation={handleDeleteConversation}
+        onGoHome={handleGoHome}
       />
       <ChatInterface
         conversation={currentConversation}

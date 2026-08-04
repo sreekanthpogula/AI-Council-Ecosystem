@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
+import { Vote, Trophy, Medal } from 'lucide-react';
 import './Stage2.css';
 
 function deAnonymizeText(text, labelToModel) {
@@ -23,7 +24,7 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
 
   return (
     <div className="stage stage2">
-      <h3 className="stage-title">Stage 2: Peer Rankings</h3>
+      <h3 className="stage-title"><Vote size={16} /> Stage 2: Peer Rankings</h3>
 
       <h4>Raw Evaluations</h4>
       <p className="stage-description">
@@ -72,14 +73,16 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
 
       {aggregateRankings && aggregateRankings.length > 0 && (
         <div className="aggregate-rankings">
-          <h4>Aggregate Rankings (Street Cred)</h4>
+          <h4><Trophy size={15} /> Aggregate Rankings</h4>
           <p className="stage-description">
             Combined results across all peer evaluations (lower score is better):
           </p>
           <div className="aggregate-list">
             {aggregateRankings.map((agg, index) => (
-              <div key={index} className="aggregate-item">
-                <span className="rank-position">#{index + 1}</span>
+              <div key={index} className={`aggregate-item ${index === 0 ? 'first-place' : ''}`}>
+                <span className={`rank-position rank-medal-${index}`}>
+                  {index < 3 ? <Medal size={17} /> : `#${index + 1}`}
+                </span>
                 <span className="rank-model">
                   {agg.model.split('/')[1] || agg.model}
                 </span>

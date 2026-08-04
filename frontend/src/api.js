@@ -1,8 +1,32 @@
 /**
- * API client for the LLM Council backend.
+ * API client for the AI-Council backend.
  */
 
 const API_BASE = 'http://localhost:8001';
+
+/**
+ * Reads a File into a base64 string (no "data:...;base64," prefix).
+ * @param {File} file
+ * @returns {Promise<string>}
+ */
+export function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function buildMessageBody(content, attachment) {
+  const body = { content };
+  if (attachment) {
+    body.attachment_base64 = attachment.base64;
+    body.attachment_mime_type = attachment.mimeType;
+    body.attachment_name = attachment.name;
+  }
+  return body;
+}
 
 export const api = {
   /**
@@ -47,9 +71,42 @@ export const api = {
   },
 
   /**
-   * Send a message in a conversation.
+   * Rename a conversation.
    */
-  async sendMessage(conversationId, content) {
+  async renameConversation(conversationId, title) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ title }),
+    });
+    if (!response.ok) {
+      throw new Error('Failed to rename conversation');
+    }
+    return response.json();
+  },
+
+  /**
+   * Delete a conversation.
+   */
+  async deleteConversation(conversationId) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      throw new Error('Failed to delete conversation');
+    }
+    return response.json();
+  },
+
+  /**
+   * Send a message in a conversation.
+   * @param {string} conversationId - The conversation ID
+   * @param {string} content - The message content
+   * @param {{base64: string, mimeType: string, name: string}|null} attachment - Optional image/audio/video attachment
+   */
+  async sendMessage(conversationId, content, attachment = null) {
     const response = await fetch(
       `${API_BASE}/api/conversations/${conversationId}/message`,
       {
@@ -57,7 +114,7 @@ export const api = {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify(buildMessageBody(content, attachment)),
       }
     );
     if (!response.ok) {
@@ -71,9 +128,10 @@ export const api = {
    * @param {string} conversationId - The conversation ID
    * @param {string} content - The message content
    * @param {function} onEvent - Callback function for each event: (eventType, data) => void
+   * @param {{base64: string, mimeType: string, name: string}|null} attachment - Optional image/audio/video attachment
    * @returns {Promise<void>}
    */
-  async sendMessageStream(conversationId, content, onEvent) {
+  async sendMessageStream(conversationId, content, onEvent, attachment = null) {
     const response = await fetch(
       `${API_BASE}/api/conversations/${conversationId}/message/stream`,
       {
@@ -81,7 +139,7 @@ export const api = {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify(buildMessageBody(content, attachment)),
       }
     );
 

@@ -1,0 +1,58 @@
+.routing-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  background: var(--surface-glass);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-sm);
+  animation: fadeInUp 0.3s ease both;
+}
+
+.routing-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  background: var(--gradient-brand);
+  color: #fff;
+  border-radius: 12px;
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  box-shadow: 0 3px 10px rgba(109, 94, 252, 0.3);
+}
+
+.routing-icon {
+  flex-shrink: 0;
+}
+
+.routing-vision .routing-badge {
+  background: linear-gradient(135deg, #ff5fa2, var(--accent-1));
+}
+
+.routing-audio .routing-badge {
+  background: linear-gradient(135deg, #f5b942, #ff5fa2);
+}
+
+.routing-acting .routing-badge {
+  background: linear-gradient(135deg, #00c2ff, #16a34a);
+}
+
+.routing-description {
+  color: var(--text-secondary);
+}
+
+.routing-models {
+  color: var(--text-tertiary);
+  margin-left: auto;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+}

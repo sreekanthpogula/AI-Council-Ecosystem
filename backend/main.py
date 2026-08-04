@@ -1,18 +1,26 @@
-"""FastAPI backend for LLM Council."""
+"""FastAPI backend for AI-Council."""
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import uuid
 import json
 import asyncio
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from . import gateway
+from .council import (
+    generate_conversation_title,
+    stage1_collect_responses,
+    stage2_collect_rankings,
+    stage3_synthesize_final,
+    calculate_aggregate_rankings,
+)
+from .config import CAPABILITY_POOLS
 
-app = FastAPI(title="LLM Council API")
+app = FastAPI(title="AI-Council API")
 
 # Enable CORS for local development
 app.add_middleware(
@@ -32,6 +40,14 @@ class CreateConversationRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     """Request to send a message in a conversation."""
     content: str
+    attachment_base64: Optional[str] = None
+    attachment_mime_type: Optional[str] = None
+    attachment_name: Optional[str] = None
+
+
+class UpdateConversationRequest(BaseModel):
+    """Request to rename a conversation."""
+    title: str
 
 
 class ConversationMetadata(BaseModel):
@@ -53,7 +69,7 @@ class Conversation(BaseModel):
 @app.get("/")
 async def root():
     """Health check endpoint."""
-    return {"status": "ok", "service": "LLM Council API"}
+    return {"status": "ok", "service": "AI-Council API"}
 
 
 @app.get("/api/conversations", response_model=List[ConversationMetadata])
@@ -79,6 +95,30 @@ async def get_conversation(conversation_id: str):
     return conversation
 
 
+@app.patch("/api/conversations/{conversation_id}", response_model=Conversation)
+async def rename_conversation(conversation_id: str, request: UpdateConversationRequest):
+    """Rename a conversation."""
+    title = request.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Title cannot be empty")
+
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    storage.update_conversation_title(conversation_id, title)
+    return storage.get_conversation(conversation_id)
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Delete a conversation."""
+    deleted = storage.delete_conversation(conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"status": "deleted", "id": conversation_id}
+
+
 @app.post("/api/conversations/{conversation_id}/message")
 async def send_message(conversation_id: str, request: SendMessageRequest):
     """
@@ -94,25 +134,40 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     is_first_message = len(conversation["messages"]) == 0
 
     # Add user message
-    storage.add_user_message(conversation_id, request.content)
+    storage.add_user_message(
+        conversation_id,
+        request.content,
+        request.attachment_base64,
+        request.attachment_mime_type,
+        request.attachment_name,
+    )
 
     # If this is the first message, generate a title
     if is_first_message:
         title = await generate_conversation_title(request.content)
         storage.update_conversation_title(conversation_id, title)
 
-    # Run the 3-stage council process
-    stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
+    # Route through the gateway and run the capability-scoped council process
+    capability, stage1_results, stage2_results, stage3_result, metadata = await gateway.run_gateway_request(
+        request.content,
+        request.attachment_base64,
+        request.attachment_mime_type,
     )
 
-    # Add assistant message with all stages
-    storage.add_assistant_message(
-        conversation_id,
-        stage1_results,
-        stage2_results,
-        stage3_result
-    )
+    # Add assistant message with all stages. A multi-minute gateway run's
+    # results shouldn't be thrown away just because the save at the very end
+    # hit a storage hiccup (e.g. the conversation file disappearing from
+    # under us) - log it and still return what the models produced.
+    try:
+        storage.add_assistant_message(
+            conversation_id,
+            stage1_results,
+            stage2_results,
+            stage3_result,
+            capability,
+        )
+    except ValueError as e:
+        print(f"Warning: failed to persist assistant message for conversation {conversation_id}: {e}")
 
     # Return the complete response with metadata
     return {
@@ -140,27 +195,51 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     async def event_generator():
         try:
             # Add user message
-            storage.add_user_message(conversation_id, request.content)
+            storage.add_user_message(
+                conversation_id,
+                request.content,
+                request.attachment_base64,
+                request.attachment_mime_type,
+                request.attachment_name,
+            )
 
             # Start title generation in parallel (don't await yet)
             title_task = None
             if is_first_message:
                 title_task = asyncio.create_task(generate_conversation_title(request.content))
 
-            # Stage 1: Collect responses
+            # Routing: boss model picks a capability pool
+            yield f"data: {json.dumps({'type': 'routing_start'})}\n\n"
+            capability = await gateway.classify_capability(request.content, request.attachment_mime_type)
+            pool = CAPABILITY_POOLS[capability]
+            models = pool["models"]
+            yield f"data: {json.dumps({'type': 'routing_complete', 'data': {'capability': capability, 'description': pool['description'], 'models': models}})}\n\n"
+
+            # Stage 1: Collect responses from the routed pool
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
+            stage1_results = await stage1_collect_responses(
+                request.content, models, request.attachment_base64, request.attachment_mime_type
+            )
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
-            # Stage 2: Collect rankings
-            yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
+            if not stage1_results:
+                stage3_result = {"model": "error", "response": "All models in the routed capability pool failed to respond. Please try again."}
+                yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+                storage.add_assistant_message(conversation_id, [], [], stage3_result, capability)
+                yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+                return
+
+            # Stage 2: Collect rankings (skipped when the pool has only one model)
+            stage2_results, label_to_model = [], {}
+            if len(stage1_results) >= 2:
+                yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
+                stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results, models)
+                aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results, pool["chairman"])
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
             # Wait for title generation if it was started
@@ -169,13 +248,18 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 storage.update_conversation_title(conversation_id, title)
                 yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
 
-            # Save complete assistant message
-            storage.add_assistant_message(
-                conversation_id,
-                stage1_results,
-                stage2_results,
-                stage3_result
-            )
+            # Save complete assistant message (see non-streaming endpoint for why
+            # this is best-effort - don't drop a completed run over a save failure)
+            try:
+                storage.add_assistant_message(
+                    conversation_id,
+                    stage1_results,
+                    stage2_results,
+                    stage3_result,
+                    capability,
+                )
+            except ValueError as e:
+                print(f"Warning: failed to persist assistant message for conversation {conversation_id}: {e}")
 
             # Send completion event
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
